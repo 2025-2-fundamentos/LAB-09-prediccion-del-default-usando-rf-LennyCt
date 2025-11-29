@@ -92,3 +92,245 @@
 # {'type': 'cm_matrix', 'dataset': 'train', 'true_0': {"predicted_0": 15562, "predicte_1": 666}, 'true_1': {"predicted_0": 3333, "predicted_1": 1444}}
 # {'type': 'cm_matrix', 'dataset': 'test', 'true_0': {"predicted_0": 15562, "predicte_1": 650}, 'true_1': {"predicted_0": 2490, "predicted_1": 1420}}
 #
+# flake8: noqa: E501
+
+# train_pipeline.py
+# flake8: noqa: E501
+import joblib
+import gzip
+import json
+import os
+import pickle
+from typing import Tuple
+
+import pandas as pd
+from sklearn.compose import ColumnTransformer
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import (
+    balanced_accuracy_score,
+    confusion_matrix,
+    f1_score,
+    precision_score,
+    recall_score,
+)
+from sklearn.model_selection import GridSearchCV
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import OneHotEncoder
+
+
+class DataProcessor:
+    """Handles data loading and cleaning operations."""
+
+    @staticmethod
+    def load_data(train_path: str, test_path: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
+        """Load train and test datasets (they are zipped CSVs)."""
+        train_df = pd.read_csv(train_path, compression="zip")
+        test_df = pd.read_csv(test_path, compression="zip")
+        return train_df, test_df
+
+    @staticmethod
+    def clean_data(df: pd.DataFrame) -> pd.DataFrame:
+        """Clean dataset according to specifications."""
+        df = df.copy()
+
+        # Rename objective and drop ID if present
+        if "default payment next month" in df.columns:
+            df = df.rename(columns={"default payment next month": "default"})
+
+        if "ID" in df.columns:
+            df = df.drop("ID", axis=1)
+
+        # Drop rows with any missing values
+        df = df.dropna()
+
+        # Convert to numeric where appropriate
+        for col in ["SEX", "EDUCATION", "MARRIAGE"]:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+
+        # Remove records with unavailable categories (values == 0 in SEX, EDUCATION, MARRIAGE)
+        for col in ["SEX", "EDUCATION", "MARRIAGE"]:
+            if col in df.columns:
+                df = df[df[col] != 0]
+
+        # Map EDUCATION values > 4 to '4' (others)
+        if "EDUCATION" in df.columns:
+            df["EDUCATION"] = df["EDUCATION"].apply(lambda x: 4 if x > 4 else x).astype(int)
+
+        # Ensure target is integer (0/1)
+        if "default" in df.columns:
+            df["default"] = df["default"].astype(int)
+
+        # Reset index
+        df = df.reset_index(drop=True)
+        return df
+
+    @staticmethod
+    def split_features_target(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Series]:
+        """Split dataset into features (X) and target (y)."""
+        X = df.drop("default", axis=1)
+        y = df["default"]
+        return X, y
+
+
+class ModelBuilder:
+    """Handles model creation and training."""
+
+    def __init__(self, random_state: int = 42):
+        self.random_state = random_state
+        # Treat these as categorical for one-hot encoding
+        self.categorical_features = ["EDUCATION", "SEX", "MARRIAGE"]
+
+    def create_pipeline(self) -> Pipeline:
+        """Create preprocessing and modeling pipeline."""
+        # If some categorical features are missing in dataset, ColumnTransformer will ignore them automatically:
+        present_cat_cols = [
+            c for c in self.categorical_features if c is not None
+        ]  # we'll pass the list as-is; OneHotEncoder(handle_unknown="ignore") will cope
+
+        preprocessor = ColumnTransformer(
+            transformers=[
+                (
+                    "onehot",
+                    OneHotEncoder(handle_unknown="ignore", sparse_output=False),
+                    self.categorical_features,
+                )
+            ],
+            remainder="passthrough",
+        )
+
+        pipeline = Pipeline(
+            steps=[
+                ("preprocessor", preprocessor),
+                ("classifier", RandomForestClassifier(random_state=self.random_state)),
+            ]
+        )
+
+        return pipeline
+
+    def optimize_hyperparameters(
+        self, X_train: pd.DataFrame, y_train: pd.Series
+    ) -> GridSearchCV:
+        """Perform hyperparameter optimization using GridSearchCV with cv=10 and balanced_accuracy scoring."""
+        pipeline = self.create_pipeline()
+
+        # Param grid can be expanded if desired; here we use sensible values but kept small to save time.
+        param_grid = {
+            "classifier__n_estimators": [200],
+            "classifier__max_depth": [None],
+            "classifier__min_samples_leaf": [2],
+            "classifier__min_samples_split": [5],
+            "classifier__max_features": ["sqrt"],
+        }
+
+        grid_search = GridSearchCV(
+            estimator=pipeline,
+            param_grid=param_grid,
+            scoring="balanced_accuracy",
+            cv=10,
+            verbose=1,
+            n_jobs=-1,
+        )
+
+        grid_search.fit(X_train, y_train)
+
+        return grid_search
+
+
+class MetricsCalculator:
+    """Handles metrics calculation and formatting."""
+
+    @staticmethod
+    def calculate_performance_metrics(estimator, X: pd.DataFrame, y: pd.Series, dataset_name: str) -> dict:
+        """Calculate precision, balanced accuracy, recall, and F1-score."""
+        y_pred = estimator.predict(X)
+
+        return {
+            "type": "metrics",
+            "dataset": dataset_name,
+            "precision": round(precision_score(y, y_pred), 4),
+            "balanced_accuracy": round(balanced_accuracy_score(y, y_pred), 4),
+            "recall": round(recall_score(y, y_pred), 4),
+            "f1_score": round(f1_score(y, y_pred), 4),
+        }
+
+    @staticmethod
+    def calculate_confusion_matrix(estimator, X: pd.DataFrame, y: pd.Series, dataset_name: str) -> dict:
+        """Calculate and format confusion matrix with desired key names."""
+        y_pred = estimator.predict(X)
+        tn, fp, fn, tp = confusion_matrix(y, y_pred).ravel()
+
+        return {
+            "type": "cm_matrix",
+            "dataset": dataset_name,
+            "true_0": {"predicted_0": int(tn), "predicted_1": int(fp)},
+            "true_1": {"predicted_0": int(fn), "predicted_1": int(tp)},
+        }
+
+class ModelPersistence:
+    @staticmethod
+    def save_model(model, filepath):
+        # Crear carpeta si no existe
+        folder = os.path.dirname(filepath)
+        os.makedirs(folder, exist_ok=True)
+
+        # Guardar usando pickle + gzip (formato esperado por pytest)
+        with gzip.open(filepath, "wb") as file:
+            pickle.dump(model, file)
+
+
+    @staticmethod
+    def save_metrics(metrics_list: list, filepath: str) -> None:
+        """Save metrics in JSON Lines format (one JSON dict per line)."""
+        os.makedirs(os.path.dirname(filepath), exist_ok=True)
+        with open(filepath, "w", encoding="utf-8") as f:
+            for metric in metrics_list:
+                f.write(json.dumps(metric) + "\n")
+
+
+def main():
+    """Main execution pipeline."""
+    processor = DataProcessor()
+
+    train_df, test_df = processor.load_data(
+        "files/input/train_data.csv.zip", "files/input/test_data.csv.zip"
+    )
+    print("Data loaded")
+
+    train_df = processor.clean_data(train_df)
+    test_df = processor.clean_data(test_df)
+    print("Data cleaned")
+
+    X_train, y_train = processor.split_features_target(train_df)
+    X_test, y_test = processor.split_features_target(test_df)
+    print("Features and target split")
+
+    model_builder = ModelBuilder(random_state=42)
+    grid_search = model_builder.optimize_hyperparameters(X_train, y_train)
+    print("Model optimized (GridSearchCV finished)")
+    print(f"Best params: {grid_search.best_params_}")
+    best_estimator = grid_search  # keep GridSearchCV object (has predict), or use grid_search.best_estimator_
+
+    # Save the full grid_search object (works) — if you prefer smaller file, save best_estimator.best_estimator_
+    ModelPersistence.save_model(best_estimator, "files/models/model.pkl.gz")
+    print("Model saved to files/models/model.pkl.gz")
+
+    metrics_calc = MetricsCalculator()
+
+    metrics_train = metrics_calc.calculate_performance_metrics(best_estimator, X_train, y_train, "train")
+    metrics_test = metrics_calc.calculate_performance_metrics(best_estimator, X_test, y_test, "test")
+    print("Performance metrics calculated")
+
+    cm_train = metrics_calc.calculate_confusion_matrix(best_estimator, X_train, y_train, "train")
+    cm_test = metrics_calc.calculate_confusion_matrix(best_estimator, X_test, y_test, "test")
+    print("Confusion matrices calculated")
+
+    all_metrics = [metrics_train, metrics_test, cm_train, cm_test]
+    ModelPersistence.save_metrics(all_metrics, "files/output/metrics.json")
+    print("Metrics saved to files/output/metrics.json")
+
+    print("\nPipeline completed successfully")
+
+
+if __name__ == "__main__":
+    main()
